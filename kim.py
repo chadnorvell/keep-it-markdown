@@ -11,7 +11,7 @@ import click
 import datetime
 from os.path import join
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from xmlrpc.client import boolean
 
 
@@ -76,18 +76,176 @@ class Options:
 @dataclass
 class Note:
     id: str
-    title: str
+    base_title: str
     text: str
     archived: boolean
     trashed: boolean
     timestamps: dict
+    # Labels starting with an uppercase letter are treated as folders, and
+    # those starting with a lowercase letter are treated as tags. Don't assign
+    # to more than one folder; only one arbitrary option will be used.
     labels: list
     blobs: list
     blob_names: list
     media: list
-    header: str
+    # Essentially datetime.now() when this is run.
+    instantiated_when: datetime.datetime = field(default_factory=datetime.datetime.now)
 
+    @property
+    def is_empty(self) -> boolean:
+        return self.base_title.strip() == '' and self.text.strip() == ''
 
+    @property
+    def is_fragment(self) -> boolean:
+        return not any([label[0].isupper() for label in self.labels])
+
+    @property
+    def created_when(self) -> datetime.datetime:
+        if self.timestamps is not None:
+            return datetime.datetime.strptime(
+                self.timestamps['created'],
+                '%Y-%m-%d %H:%M:%S.%f',
+            )
+
+        return self.instantiated_when
+
+    @property
+    def updated_when(self) -> datetime.datetime:
+        if self.timestamps is not None:
+            return datetime.datetime.strptime(
+                self.timestamps['updated'],
+                '%Y-%m-%d %H:%M:%S.%f',
+            )
+
+        return self.instantiated_when
+
+    @property
+    def title(self) -> str:
+        title = ''.join(c for c in self.base_title if c.isalnum() or c.isspace())
+
+        # If there's no title or content, try to infer a title from an attachment.
+        if title.strip() == '' and self.text.strip() == '':
+            try:
+                file_type = self.media[0].split('.')[-1]
+            except IndexError:
+                file_type = None
+
+            if file_type is not None:
+                if file_type in ('jpg', 'png'):
+                    title = 'Image'
+
+                else:
+                    title = 'File'
+
+        # If there's no title, try to infer one from the text.
+        elif title.strip() == '':
+            first_line = self.text.split('\n')[0]
+            first_phrase = re.split(r'[\.,:;?!]', first_line)[0]
+            first_phrase_clean = ''.join(c for c in first_phrase if c.isalnum() or c.isspace())
+            title = first_phrase_clean.strip()[:64]
+
+        # If it's a fragment, prepend the timestamp. A timestamp-only title is fine.
+        if self.is_fragment:
+            title_text = title
+            title = self.created_when.strftime('%y%m%d%H%M%S')
+
+            if len(title_text) > 0:
+                title += f' {title_text}'
+
+        return title
+
+    @property
+    def content(self) -> str:
+        text = Markdown(self.text).convert_urls().format_check_boxes().text
+
+        if text != '':
+            text += '\n\n'
+
+        for media in self.media:
+            text += Markdown.format_path(Config().get("media_path") +
+                "/" + media, "", True, "_") + "\n"
+
+        return text
+
+    @property
+    def tags(self) -> list[str]:
+        return [label for label in self.labels if label[0].islower()]
+
+    @property
+    def folder(self) -> str:
+        if self.is_fragment:
+            return 'Fragments'
+
+        try:
+            return [label for label in self.labels if label[0].isupper()][0]
+        except IndexError:
+            return '.'
+
+    @property
+    def filename(self) -> str:
+        return f'{self.title}.md'
+
+    @property
+    def path(self) -> Path:
+        return Path(self.folder, self.filename)
+
+    @property
+    def front_matter(self) -> str:
+        lines = [
+            '---',
+            f'created: {self.created_when.strftime("%Y-%m-%dT%H:%M")}',
+            f'updated: {self.updated_when.strftime("%Y-%m-%dT%H:%M")}',
+            f'source: {KEEP_NOTE_URL}{str(self.id)}',
+        ]
+
+        if len(self.tags) > 0:
+            lines += ['tags:']
+
+            for tag in self.tags:
+                lines += [f'  - {tag}']
+
+        lines += ['---\n']
+        return '\n'.join(lines)
+
+    def populate_media(self, keep):
+        fs = FileService()
+
+        for idx, blob in enumerate(self.blobs):
+            blob_name = f'{self.id}_{str(idx)}'
+
+            if blob != None:
+                url = keep.getmedia(blob)
+                blob_file = None
+                if url:
+                    blob_file = fs.download_file(url, blob_name + ".dat", fs.media_path())
+                    if blob_file:
+                        data_file = fs.set_file_extensions(blob_file, blob_name, fs.media_path())
+                        self.blob_names.append(blob_name)
+                        self.media.append(data_file)
+                    else:
+                        print ("Download of Keep media failed...")
+
+    def save(self):
+        fs = FileService()
+
+        md_text = self.content
+
+        for media in self.media:
+            md_text = Markdown.format_path(Config().get("media_path") +
+                "/" + media, "", True, "_") + "\n" + md_text
+
+        md_file = Path(fs.outpath(), self.path)
+
+        markdown_data = (
+            self.front_matter +
+            self.content +
+            "\n"
+        )
+
+        fs.write_file(md_file, markdown_data)
+
+    def conditionally_save(self):
+        self.save()
 
 
 class ConfigurationException(Exception):
@@ -142,44 +300,29 @@ class Config:
             raise ConfigurationException(KEYERR_CONFIG_FILE + key)
 
 
-#All conversions to markdown are static methods 
 class Markdown:
-    @staticmethod
-    def convert_urls(text):
+    def __init__(self, text: str):
+        self.text = text
+
+    def convert_urls(self) -> 'Markdown':
         # pylint: disable=anomalous-backslash-in-string
         urls = re.findall(
             "http[s]?://(?:[a-zA-Z]|[0-9]|[~#$-_@.&+]"
                 "|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
-            text
+            self.text
         )
-        #Note that the use of temporary %%% is because notes 
+        #Note that the use of temporary %%% is because notes
         #   can have the same URL repeated and replace would fail
         for url in urls:
-            text = text.replace(url, 
-                "[" + url[:1] + "%%%" + url[2:] + 
+            self.text = self.text.replace(url,
+                "[" + url[:1] + "%%%" + url[2:] +
                 "](" + url[:1] + "%%%" + url[2:] + ")", 1)
 
-        return text.replace("h%%%tp", "http")
+        return self.__class__(self.text.replace("h%%%tp", "http"))
 
-    @staticmethod
-    def format_checkboxes(text):
-        md_text = text.replace(u"\u2610", '- [ ]') \
-            .replace(u"\u2611", ' - [x]')
-        return md_text
-
-    #this feels more like a file utility than a markdown utility
-    @staticmethod
-    def format_title(title):
-        title = re.sub(
-            '[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', 
-            ' ', 
-            title[0:MAX_FILENAME_LENGTH]
-        ) 
-        return title
-
-    @staticmethod
-    def format_check_boxes(text):
-        return(text.replace(u"\u2610", '- [ ]').replace(u"\u2611", ' - [x]'))
+    def format_check_boxes(self) -> 'Markdown':
+        text = self.text.replace(u"\u2610", '- [ ]').replace(u"\u2611", ' - [x]')
+        return self.__class__(text)
 
     @staticmethod
     def format_path(path, name, media, replacement):
@@ -350,6 +493,9 @@ class FileService:
             os.mkdir(path)
 
     def write_file(self, file_name, data):
+        if file_name.parent != Path('.'):
+            file_name.parent.mkdir(parents=True, exist_ok=True)
+
         try:
             f = open(file_name, "w+", encoding='utf-8', errors="ignore")
             f.write(data)
@@ -404,54 +550,6 @@ class FileService:
 
 
 
-def save_md_file(note, note_tags, note_date, overwrite, skip_existing):
-    try:
-        fs = FileService()
-
-        md_text = Markdown().format_check_boxes(note.text)
-        note.title = NameService().check_duplicate_name(note.title, note_date)
-
-        for media in note.media:
-            md_text = Markdown().format_path(Config().get("media_path") + 
-                "/" + media, "", True, "_") + "\n" + md_text
- 
-
-        md_file = Path(fs.outpath(), note.title + ".md")
-        if not overwrite:
-            if md_file.exists():
-                if skip_existing:
-                    return (0)
-                else:
-                    note.title = NameService().check_file_exists(
-                            md_file, fs.outpath(), note.title, note_date)
-                    md_file = Path(fs.outpath(), note.title + ".md")
-
-        print(note.title)
-        print(note_tags)
-        print(note_date + "\r\n")
-
-        if not (note.timestamps):
-            timestamps = ""
-        else:
-            timestamps = ("Created: " + note.timestamps["created"]
-                        [ : note.timestamps["created"].rfind('.') ] + "   ---   " + 
-                        "Updated: " + note.timestamps["updated"]
-                        [ : note.timestamps["updated"].rfind('.') ] + "\n\n")
-
-        markdown_data = (
-            note.header + 
-            Markdown().convert_urls(md_text) + "\n" + 
-            "\n" + note_tags + "\n\n" + 
-            timestamps + 
-            Markdown().format_path(KEEP_NOTE_URL + str(note.id), "", False, "%20") + "\n\n")
-
-        fs.write_file(md_file, markdown_data)
-        return (1)
-    except Exception as e:
-        raise Exception("Problem with markdown file creation: " + str(md_file) + " -- " + TECH_ERR + repr(e))
-
-
-
 def keep_import_notes(keep):
     try:
         dir_path = FileService().inpath()
@@ -474,28 +572,9 @@ def keep_import_notes(keep):
         print('Error on note import:', str(e))
 
 
-
-def keep_get_blobs(keep, note):
-    fs = FileService()
-    for idx, blob in enumerate(note.blobs):
-        note.blob_names[idx] = note.title.replace(" ", "_") + str(idx)
-        if blob != None:
-            url = keep.getmedia(blob)
-            blob_file = None
-            if url:
-                blob_file = fs.download_file(url, note.blob_names[idx] + ".dat", fs.media_path()) 
-                if blob_file:
-                    data_file = fs.set_file_extensions(blob_file, note.blob_names[idx], fs.media_path())
-                    note.media.append(data_file)
-                else:
-                    print ("Download of Keep media failed...")
-
-
-
 def keep_query_convert(keep, keepquery, opts):
     try:
         count = 0
-        ccnt = 0
 
         if keepquery == "--all":
             gnotes = keep.getnotes()
@@ -519,85 +598,21 @@ def keep_query_convert(keep, keepquery, opts):
                         "updated": str(gnote.timestamps.updated)},
                     [str(label) for label in gnote.labels.all()],
                     [blob for blob in gnote.blobs],
-                    ['' for blob in gnote.blobs], 
                     [],
-                    ""
+                    [],
                    )
             )
  
         for note in notes:
+           note.populate_media(keep)
 
-            note_date = re.sub('[^A-z0-9-]', ' ', note.timestamps["created"].replace(":", "").replace(".", "-"))
+           if note.title != '' and not note.archived and not note.trashed:
+               print(note.path)
+               note.conditionally_save()
+               count += 1
 
-            if note.title == '':
-                if opts.text_for_title:
-                    if note.text == '':
-                        note.title = note_date
-                    else:
-                        note.title = re.sub('[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', '', note.text[0:50])  #.replace(' ',''))
-                else:
-                    note.title = note_date
+        return count
 
-            note.title = re.sub('[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', ' ', note.title[0:99]) 
-
-            labels = note.labels
-            note_labels = ""
-            if opts.preserve_labels:
-                for label in labels:
-                    note_labels = note_labels + " #" + str(label)
-            else:
-                for label in labels:
-                    note_labels = note_labels + " #" + str(label).replace(' ', '-').replace('&', 'and')
-                note_labels = re.sub('[' + re.escape(''.join(ILLEGAL_TAG_CHARS)) + 
-                                     ']', '-', note_labels)  
-
-            if opts.logseq_style:
-                c = note.text[:1]
-                if c == u"\u2610" or c == u"\u2611":
-                    note.text.replace("\n\n", "\n- ")
-                else:
-                    note.text = "- " + note.text.replace("\n\n", "\n- ")
-
-            if opts.joplin_frontmatter:
-                joplin_labels = ""
-                for label in note_labels.replace("#", "").split():
-                    joplin_labels += "  - " + label + "\n"
-                note.header = ("---\ntitle: " + note.title + 
-                            "\nupdated: " + note.timestamps["updated"] + 
-                            "Z\ncreated: " + note.timestamps["created"] + 
-                            "Z\ntags:\n" + joplin_labels + 
-                            "---\n\n")
-                note_labels = ""
-                note.timestamps = {}
-
-
-            if opts.archive_only:
-                if note.archived and note.trashed == False:
-                    keep_get_blobs(keep, note)
-                    ccnt = save_md_file(note, 
-                                        note_labels, 
-                                        note_date, 
-                                        opts.overwrite, 
-                                        opts.skip_existing)
-                else:
-                    ccnt = 0
-            else:
-                if note.archived == False and note.trashed == False:
-                    keep_get_blobs(keep, note)
-                    ccnt = save_md_file(note, 
-                                        note_labels, 
-                                        note_date, 
-                                        opts.overwrite, 
-                                        opts.skip_existing)
-                else:
-                    ccnt = 0
-
-            count = count + ccnt
-
-        if opts.overwrite or opts.skip_existing:
-            NameService().clear_name_list()
-
-        return (count)
     except:
         print("Error in keep_query_convert()")
         raise

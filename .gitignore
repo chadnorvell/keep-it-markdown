@@ -6,3 +6,4 @@ mdfiles/
 backup/
 .vscode/
 **/__pycache__
+.python-version
