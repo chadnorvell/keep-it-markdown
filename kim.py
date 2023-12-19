@@ -1,12 +1,11 @@
-import configparser
 import datetime
 import getpass
 import imghdr
 import os
 import re
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable, Optional
 from xmlrpc.client import boolean
 
 import click
@@ -16,100 +15,43 @@ import requests
 
 KEEP_KEYRING_ID = "google-keep-token"
 KEEP_NOTE_URL = "https://keep.google.com/#NOTE/"
-CONFIG_FILE = "settings.cfg"
-DEFAULT_SECTION = "SETTINGS"
-USERID_EMPTY = "add your google account name here"
-OUTPUTPATH = "mdfiles"
-MEDIADEFAULTPATH = "media"
-INPUTDEFAULTPATH = "import/markdown_files"
-DEFAULT_LABELS = "my_label"
-DEFAULT_SEPARATOR = "/"
-MAX_FILENAME_LENGTH = 99
-MISSING = "null value"
 
-TECH_ERR = " Technical Error Message: "
-
-CONFIG_FILE_MESSAGE = (
-    f"Your {CONFIG_FILE} file contains to the following "
-    f"[{DEFAULT_SECTION}] values. Be sure to edit it with "
-    " your information."
-)
-MALFORMED_CONFIG_FILE = (
-    f"The {CONFIG_FILE} default settings file exists but "
-    f"has a malformed header - header should be [{DEFAULT_SECTION}]"
-)
-UNKNOWNN_CONFIG_FILE = (
-    "There is an unknown configuration file issue - "
-    f"{CONFIG_FILE} or file system may be locked or "
-    "corrupted. Try deleting the file and recreating it."
-)
-MISSING_CONFIG_FILE = (
-    f"The configuration file - {CONFIG_FILE} is missing. "
-    "Please check the documention on recreating it"
-)
-BADFILE_CONFIG_FILE = (
-    f"Unable to create {CONFIG_FILE}. "
-    "The file system issue such as locked or corrupted"
-)
-KEYERR_CONFIG_FILE = f"Configuration key in {CONFIG_FILE} not found. Key passed is: "
-
-
-ILLEGAL_FILE_CHARS = [
-    "<",
-    ">",
-    ":",
-    '"',
-    "/",
-    "\\",
-    "|",
-    "?",
-    "*",
-    "&",
-    "\n",
-    "\r",
-    "\t",
-]
-ILLEGAL_TAG_CHARS = [
-    "~",
-    "`",
-    "!",
-    "@",
-    "$",
-    "%",
-    "^",
-    "(",
-    ")",
-    "+",
-    "=",
-    "{",
-    "}",
-    "[",
-    "]",
-    "<",
-    ">",
-    ";",
-    ":",
-    ",",
-    ".",
-    '"',
-    "/",
-    "\\",
-    "|",
-    "?",
-    "*",
-    "&",
-    "\n",
-    "\r",
-]
-
-default_settings = {
-    "google_userid": USERID_EMPTY,
-    "output_path": OUTPUTPATH,
-    "media_path": MEDIADEFAULTPATH,
-    "input_path": INPUTDEFAULTPATH,
-    "input_labels": DEFAULT_LABELS,
-    "folder_separator": DEFAULT_SEPARATOR,
+settings = {
+    "google_userid": os.environ.get("KIM_GOOGLE_USER_ID", ""),
+    "export_path": os.environ.get("KIM_EXPORT_PATH", "export"),
+    "media_path": os.environ.get("KIM_MEDIA_PATH", "media"),
+    "fragments_path": os.environ.get("KIM_FRAGMENTS_PATH", "fragments"),
+    "import_path": os.environ.get("KIM_IMPORT_PATH", "import"),
+    "import_labels": os.environ.get("KIM_IMPORT_LABELS", "my_label"),
 }
+
+
+def download_file(file_url: str, file_name: str, file_path: Path) -> Optional[Path]:
+    data_file = file_path / file_name
+    r = requests.get(file_url, timeout=10)
+
+    if r.status_code == 200:
+        with open(data_file, "wb") as f:
+            f.write(r.content)
+
+        return data_file
+
+    return None
+
+
+def set_file_extension_from_content(data_file: Path) -> Path:
+    if imghdr.what(data_file) == "png":
+        renamed = data_file.with_suffix(".png")
+    elif imghdr.what(data_file) == "jpeg":
+        renamed = data_file.with_suffix(".jpg")
+    elif imghdr.what(data_file) == "gif":
+        renamed = data_file.with_suffix(".gif")
+    elif imghdr.what(data_file) == "webp":
+        renamed = data_file.with_suffix(".webp")
+    else:
+        renamed = data_file.with_suffix(".m4a")
+
+    return data_file.rename(renamed)
 
 
 @dataclass
@@ -135,10 +77,10 @@ class Note:
     # Labels starting with an uppercase letter are treated as folders, and
     # those starting with a lowercase letter are treated as tags. Don't assign
     # to more than one folder; only one arbitrary option will be used.
-    labels: list
+    labels: list[str]
     blobs: list
-    blob_names: list
-    media: list
+    blob_names: list[str]
+    media: list[Path]
     # Essentially datetime.now() when this is run.
     instantiated_when: datetime.datetime = field(default_factory=datetime.datetime.now)
 
@@ -171,18 +113,25 @@ class Note:
         return self.instantiated_when
 
     @property
+    def media_links(self) -> Iterable[str]:
+        for item in self.media:
+            yield Markdown.format_path(
+                item.relative_to(settings["export_path"]), media=True
+            )
+
+    @property
     def title(self) -> str:
         title = "".join(c for c in self.base_title if c.isalnum() or c.isspace())
 
         # If there's no title or content, try to infer a title from an attachment.
         if title.strip() == "" and self.text.strip() == "":
             try:
-                file_type = self.media[0].split(".")[-1]
+                file_type = self.media[0].suffix
             except IndexError:
                 file_type = None
 
             if file_type is not None:
-                if file_type in ("jpg", "png"):
+                if file_type in (".jpg", ".png"):
                     title = "Image"
 
                 else:
@@ -214,13 +163,8 @@ class Note:
         if text != "":
             text += "\n\n"
 
-        for media in self.media:
-            text += (
-                Markdown.format_path(
-                    Config().get("media_path") + "/" + media, "", True, "_"
-                )
-                + "\n"
-            )
+        for media in self.media_links:
+            text += f"{media}\n"
 
         return text
 
@@ -231,7 +175,7 @@ class Note:
     @property
     def folder(self) -> str:
         if self.is_fragment:
-            return "Fragments"
+            return settings["fragments_path"]
 
         try:
             return [label for label in self.labels if label[0].isupper()][0]
@@ -264,8 +208,11 @@ class Note:
         lines += ["---\n"]
         return "\n".join(lines)
 
-    def populate_media(self, keep):
-        fs = FileService()
+    def populate_media(self, keep) -> None:
+        media_path = Path(settings["export_path"], settings["media_path"])
+
+        if not media_path.exists():
+            media_path.mkdir(parents=True)
 
         for idx, blob in enumerate(self.blobs):
             blob_name = f"{self.id}_{str(idx)}"
@@ -274,91 +221,26 @@ class Note:
                 url = keep.getmedia(blob)
                 blob_file = None
                 if url:
-                    blob_file = fs.download_file(
-                        url, blob_name + ".dat", fs.media_path()
+                    blob_file = download_file(
+                        url,
+                        blob_name + ".dat",
+                        media_path,
                     )
                     if blob_file:
-                        data_file = fs.set_file_extensions(
-                            blob_file, blob_name, fs.media_path()
-                        )
+                        data_file = set_file_extension_from_content(blob_file)
                         self.blob_names.append(blob_name)
                         self.media.append(data_file)
                     else:
                         print("Download of Keep media failed...")
 
-    def save(self):
-        fs = FileService()
-
-        md_text = self.content
-
-        for media in self.media:
-            md_text = (
-                Markdown.format_path(
-                    Config().get("media_path") + "/" + media, "", True, "_"
-                )
-                + "\n"
-                + md_text
-            )
-
-        md_file = Path(fs.outpath(), self.path)
-
-        markdown_data = self.front_matter + self.content + "\n"
-
-        fs.write_file(md_file, markdown_data)
+    def save(self) -> None:
+        data = self.front_matter + self.content + "\n"
+        path = settings["export_path"] / self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data, encoding="utf-8", errors="ignore")
 
     def conditionally_save(self):
         self.save()
-
-
-class ConfigurationException(Exception):
-    def __init__(self, msg):
-        self.msg = msg
-
-    def __str__(self):
-        return self.msg
-
-
-# This is a singleton class instance - not really necessary but saves a tiny bit of memory
-# Very useful for single connections and loading config files once
-class Config:
-    _config = configparser.ConfigParser()
-    _configdict = {}
-
-    def __new__(cls):
-        if not hasattr(cls, "instance"):
-            cls.instance = super(Config, cls).__new__(cls)
-            cls.instance.__read()
-            cls.instance.__load()
-        return cls.instance
-
-    def __read(self):
-        try:
-            self._cfile = self._config.read(CONFIG_FILE)
-            if not self._cfile:
-                self.__create()
-        except configparser.MissingSectionHeaderError:
-            raise ConfigurationException(MALFORMED_CONFIG_FILE)
-        except Exception:
-            raise ConfigurationException(UNKNOWNN_CONFIG_FILE)
-
-    def __create(self):
-        self._config[DEFAULT_SECTION] = default_settings
-        try:
-            with open(CONFIG_FILE, "w") as configfile:
-                self._config.write(configfile)
-        except Exception as e:
-            raise ConfigurationException(BADFILE_CONFIG_FILE)
-
-    def __load(self):
-        options = self._config.options(DEFAULT_SECTION)
-        for option in options:
-            self._configdict[option] = self._config.get(DEFAULT_SECTION, option)
-
-    def get(self, key):
-        try:
-            return self._configdict[key]
-        except Exception as e:
-            raise ConfigurationException(KEYERR_CONFIG_FILE + key)
 
 
 class Markdown:
@@ -386,16 +268,10 @@ class Markdown:
         return self.__class__(text)
 
     @staticmethod
-    def format_path(path, name, media, replacement):
-        if media:
-            header = "!["
-        else:
-            header = "["
-        path = path.replace(" ", replacement)
-        if name:
-            return header + name + "](" + path + ")"
-        else:
-            return header + path + "](" + path + ")"
+    def format_path(path: Path, name: Optional[str] = None, media: bool = False):
+        sigil = "!" if media else ""
+        slug = name if name is not None else path
+        return f"{sigil}[{slug}]({path})"
 
 
 class SecureStorage:
@@ -502,178 +378,68 @@ class KeepService:
             return None
 
 
-class NameService:
-    def __new__(cls):
-        if not hasattr(cls, "instance"):
-            cls.instance = super(NameService, cls).__new__(cls)
-            cls.instance._namelist = []
-        return cls.instance
-
-    def clear_name_list(self):
-        self._namelist.clear()
-
-    def check_duplicate_name(self, note_title, note_date):
-        if note_title in self._namelist:
-            note_title = note_title + note_date
-            note_title = self.check_duplicate_name(note_title, note_date)
-        self._namelist.append(note_title)
-        return note_title
-
-    def check_file_exists(self, md_file, outpath, note_title, note_date):
-        # md_file = Path(outpath, note_title + ".md")
-        self._namelist.remove(note_title)
-        while md_file.exists():
-            note_title = self.check_duplicate_name(note_title, note_date)
-            self._namelist.append(note_title)
-            md_file = Path(outpath, note_title + ".md")
-        return note_title
-
-
-class FileService:
-    def media_path(self):
-        outpath = Config().get("output_path").rstrip("/")
-        mediapath = outpath + "/" + Config().get("media_path").rstrip("/") + "/"
-        return mediapath
-
-    def outpath(self):
-        outpath = Config().get("output_path").rstrip("/")
-        return outpath
-
-    def inpath(self):
-        inpath = Config().get("input_path").rstrip("/") + "/"
-        return inpath
-
-    def create_path(self, path):
-        if not os.path.exists(path):
-            os.mkdir(path)
-
-    def write_file(self, file_name, data):
-        if file_name.parent != Path("."):
-            file_name.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            f = open(file_name, "w+", encoding="utf-8", errors="ignore")
-            f.write(data)
-            f.close()
-        except Exception as e:
-            raise Exception("Error in write_file: " + " -- " + TECH_ERR + repr(e))
-
-    def download_file(self, file_url, file_name, file_path):
-        try:
-            data_file = file_path + file_name
-            r = requests.get(file_url)
-            if r.status_code == 200:
-                with open(data_file, "wb") as f:
-                    f.write(r.content)
-                    f.close
-                return data_file
-
-            else:
-                blob_final_path = "Media could not be retrieved"
-                return ""
-
-        except:
-            print("Error in download_file()")
-            raise
-
-    def set_file_extensions(self, data_file, file_name, file_path):
-        dest_path = file_path + file_name
-
-        if imghdr.what(data_file) == "png":
-            media_name = file_name + ".png"
-            blob_final_path = dest_path + ".png"
-        elif imghdr.what(data_file) == "jpeg":
-            media_name = file_name + ".jpg"
-            blob_final_path = dest_path + ".jpg"
-        elif imghdr.what(data_file) == "gif":
-            media_name = file_name + ".gif"
-            blob_final_path = dest_path + ".gif"
-        elif imghdr.what(data_file) == "webp":
-            media_name = file_name + ".webp"
-            blob_final_path = dest_path + ".webp"
-        else:
-            extension = ".m4a"
-            media_name = file_name + extension
-            blob_final_path = dest_path + extension
-
-        shutil.copyfile(data_file, blob_final_path)
-
-        if os.path.exists(data_file):
-            os.remove(data_file)
-
-        return media_name
-
-
 def keep_import_notes(keep):
-    try:
-        dir_path = FileService().inpath()
-        in_labels = Config().get("input_labels").split(",")
-        for file in os.listdir(dir_path):
-            if os.path.isfile(dir_path + file) and file.endswith(".md"):
-                with open(dir_path + file, "r", encoding="utf8") as md_file:
-                    mod_time = datetime.datetime.fromtimestamp(
-                        os.path.getmtime(dir_path + file)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                    crt_time = datetime.datetime.fromtimestamp(
-                        os.path.getctime(dir_path + file)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                    data = md_file.read()
-                    data += "\n\nCreated: " + crt_time + "   -   Updated: " + mod_time
-                    print("Importing note:", file.replace(".md", "") + " from " + file)
-                    keep.createnote(file.replace(".md", ""), data)
-                    for in_label in in_labels:
-                        keep.setnotelabel(in_label.strip())
-                    keep.keep_sync()
-    except Exception as e:
-        print("Error on note import:", str(e))
+    dir_path = settings["import_path"]
+    in_labels = settings["import_labels"].split(",")
+    for file in os.listdir(dir_path):
+        if os.path.isfile(dir_path + file) and file.endswith(".md"):
+            with open(dir_path + file, "r", encoding="utf8") as md_file:
+                mod_time = datetime.datetime.fromtimestamp(
+                    os.path.getmtime(dir_path + file)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                crt_time = datetime.datetime.fromtimestamp(
+                    os.path.getctime(dir_path + file)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                data = md_file.read()
+                data += "\n\nCreated: " + crt_time + "   -   Updated: " + mod_time
+                print("Importing note:", file.replace(".md", "") + " from " + file)
+                keep.createnote(file.replace(".md", ""), data)
+                for in_label in in_labels:
+                    keep.setnotelabel(in_label.strip())
+                keep.keep_sync()
 
 
 def keep_query_convert(keep, keepquery, opts):
-    try:
-        count = 0
+    count = 0
 
-        if keepquery == "--all":
-            gnotes = keep.getnotes()
+    if keepquery == "--all":
+        gnotes = keep.getnotes()
+    else:
+        if keepquery[0] == "#":
+            gnotes = keep.findnotes(keepquery, True, opts.archive_only)
         else:
-            if keepquery[0] == "#":
-                gnotes = keep.findnotes(keepquery, True, opts.archive_only)
-            else:
-                gnotes = keep.findnotes(keepquery, False, opts.archive_only)
+            gnotes = keep.findnotes(keepquery, False, opts.archive_only)
 
-        notes = []
+    notes = []
 
-        for gnote in gnotes:
-            notes.append(
-                Note(
-                    gnote.id,
-                    gnote.title,
-                    gnote.text,
-                    gnote.archived,
-                    gnote.trashed,
-                    {
-                        "created": str(gnote.timestamps.created),
-                        "updated": str(gnote.timestamps.updated),
-                    },
-                    [str(label) for label in gnote.labels.all()],
-                    list(gnote.blobs),
-                    [],
-                    [],
-                )
+    for gnote in gnotes:
+        notes.append(
+            Note(
+                gnote.id,
+                gnote.title,
+                gnote.text,
+                gnote.archived,
+                gnote.trashed,
+                {
+                    "created": str(gnote.timestamps.created),
+                    "updated": str(gnote.timestamps.updated),
+                },
+                [str(label) for label in gnote.labels.all()],
+                list(gnote.blobs),
+                [],
+                [],
             )
+        )
 
-        for note in notes:
-            note.populate_media(keep)
+    for note in notes:
+        note.populate_media(keep)
 
-            if note.title != "" and not note.archived and not note.trashed:
-                print(note.path)
-                note.conditionally_save()
-                count += 1
+        if note.title != "" and not note.archived and not note.trashed:
+            print(note.path)
+            note.conditionally_save()
+            count += 1
 
-        return count
-
-    except:
-        print("Error in keep_query_convert()")
-        raise
+    return count
 
 
 # --------------------- UI / CLI ------------------------------
@@ -681,14 +447,12 @@ def keep_query_convert(keep, keepquery, opts):
 
 def ui_login(keyring_reset, master_token):
     try:
-        userid = Config().get("google_userid").strip().lower()
+        userid = settings["google_userid"].strip().lower()
 
-        if userid == USERID_EMPTY:
+        if userid == "":
             userid = click.prompt("Enter your Google account username", type=str)
         else:
-            print(
-                f"Your Google account name is: {userid} -- Welcome!"
-            )
+            print(f"Your Google account name is: {userid} -- Welcome!")
 
         # 0.5.0 work
         keep = KeepService(userid)
@@ -725,48 +489,33 @@ def ui_login(keyring_reset, master_token):
 
 
 def ui_query(keep, search_term, opts):
-    try:
-        if search_term is not None:
-            count = keep_query_convert(keep, search_term, opts)
-            print("\nTotal converted notes: " + str(count))
-            return
-        else:
-            kquery = "kquery"
-            while kquery:
-                kquery = click.prompt(
-                    "\r\nEnter a keyword search, label search or "
-                    + "'--all' to convert Keep notes to md or '--x' to exit",
-                    type=str,
-                )
-                if kquery != "--x":
-                    count = keep_query_convert(keep, kquery, opts)
-                    print("\nTotal converted notes: " + str(count))
-                else:
-                    return
-    except Exception as e:
-        print("Conversion to markdown error - " + repr(e) + " ")
-        raise
+    if search_term is not None:
+        count = keep_query_convert(keep, search_term, opts)
+        print("\nTotal converted notes: " + str(count))
+        return
+    else:
+        kquery = "kquery"
+        while kquery:
+            kquery = click.prompt(
+                "\r\nEnter a keyword search, label search or "
+                + "'--all' to convert Keep notes to md or '--x' to exit",
+                type=str,
+            )
+            if kquery != "--x":
+                count = keep_query_convert(keep, kquery, opts)
+                print("\nTotal converted notes: " + str(count))
+            else:
+                return
 
 
 def ui_welcome_config():
-    try:
-        mp = Config().get("media_path")
+    mp = settings["media_path"]
 
-        if (":" in mp) or (mp[0] == "/"):
-            raise ValueError(
-                f"Media path: '{mp}' within your config file - {CONFIG_FILE}"
-                " - must be relative to the output path and cannot start with / or a drive-mount"
-            )
-
-        # Make sure paths are set before doing anything
-        fs = FileService()
-        fs.create_path(fs.outpath())
-        fs.create_path(fs.media_path())
-
-        # return defaults
-    except Exception as e:
-        print(f"\r\nConfiguration file error - {CONFIG_FILE} - {repr(e)}")
-        raise
+    if (":" in mp) or (mp[0] == "/"):
+        raise ValueError(
+            f"Media path: '{mp}' - must be relative to the output path "
+            "and cannot start with / or a drive-mount"
+        )
 
 
 @click.command()
@@ -802,38 +551,32 @@ def ui_welcome_config():
 )
 @click.option("-t", "--master-token", help="Log in using master keep token")
 def main(r, o, a, p, s, c, l, j, i, search_term, master_token):
-    try:
-        # j = True
-        opts = Options(o, a, p, s, c, l, j, i)
-        click.echo("\r\nWelcome to Keep it Markdown or KIM!\r\n")
+    # j = True
+    opts = Options(o, a, p, s, c, l, j, i)
+    click.echo("\r\nWelcome to Keep it Markdown or KIM!\r\n")
 
-        if i and (r or o or a or s or p or c):
-            print(
-                "Importing markdown notes with export options is not compatible -- "
-                "please use -i only to import"
-            )
-            exit()
+    if i and (r or o or a or s or p or c):
+        print(
+            "Importing markdown notes with export options is not compatible -- "
+            "please use -i only to import"
+        )
+        exit()
 
-        if o and s:
-            print(
-                "Overwrite and Skip flags are not compatible together -- "
-                "please use one or the other..."
-            )
-            exit()
+    if o and s:
+        print(
+            "Overwrite and Skip flags are not compatible together -- "
+            "please use one or the other..."
+        )
+        exit()
 
-        ui_welcome_config()
+    ui_welcome_config()
 
-        keep = ui_login(r, master_token)
+    keep = ui_login(r, master_token)
 
-        if i:
-            keep_import_notes(keep)
-        else:
-            ui_query(keep, search_term, opts)
-
-    except:
-        print("Could not excute KIM")
-    # except Exception as e:
-    #    raise Exception("Problem with markdown file creation: " + repr(e))
+    if i:
+        keep_import_notes(keep)
+    else:
+        ui_query(keep, search_term, opts)
 
 
 # Version 0.5.2
