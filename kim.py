@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import getpass
 import imghdr
@@ -5,19 +6,23 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 from xmlrpc.client import boolean
 
 import click
 import gkeepapi
 import keyring
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 KEEP_KEYRING_ID = "google-keep-token"
 KEEP_NOTE_URL = "https://keep.google.com/#NOTE/"
 
 settings = {
     "google_userid": os.environ.get("KIM_GOOGLE_USER_ID", ""),
+    "master_token": os.environ.get("KIM_KEEP_MASTER_TOKEN", ""),
     "export_path": os.environ.get("KIM_EXPORT_PATH", "export"),
     "media_path": os.environ.get("KIM_MEDIA_PATH", "media"),
     "fragments_path": os.environ.get("KIM_FRAGMENTS_PATH", "fragments"),
@@ -264,7 +269,7 @@ class Markdown:
         return self.__class__(self.text.replace("h%%%tp", "http"))
 
     def format_check_boxes(self) -> "Markdown":
-        text = self.text.replace("\u2610", "- [ ]").replace("\u2611", " - [x]")
+        text = self.text.replace("\u2610", "- [ ]").replace("\u2611", "- [x]")
         return self.__class__(text)
 
     @staticmethod
@@ -310,10 +315,12 @@ class KeepService:
         self._keepapi.sync()
 
     def set_token(self, keyring_reset, master_token):
-        self._securestorage = SecureStorage(self._userid, keyring_reset, master_token)
         if master_token:
             self._keep_token = master_token
         else:
+            self._securestorage = SecureStorage(
+                self._userid, keyring_reset, master_token
+            )
             self._keep_token = self._securestorage.get_keyring()
         return self._keep_token
 
@@ -348,6 +355,32 @@ class KeepService:
             return self._keepapi.find(
                 query=kquery, archived=archive_only, trashed=False
             )
+
+    def get_notes(
+        self,
+        labels: Optional[list[str]] = None,
+        pinned: Optional[bool] = None,
+        archived: Optional[bool] = None,
+        trashed: Optional[bool] = None,
+    ):
+        if labels is not None:
+            label_query = [self._keepapi.findLabel(label) for label in labels]
+            label_results = [label for label in label_query if label is not None]
+
+            kwargs: dict[str, Any] = {"labels": label_results}
+
+            if pinned is not None:
+                kwargs["pinned"] = pinned
+
+            if archived is not None:
+                kwargs["archived"] = archived
+
+            if trashed is not None:
+                kwargs["trashed"] = trashed
+
+            return self._keepapi.find(**kwargs)
+
+        return self._keepapi.all()
 
     def createnote(self, title, notetext):
         self._note = self._keepapi.createNote(title, notetext)
@@ -399,18 +432,10 @@ def keep_import_notes(keep):
                 keep.keep_sync()
 
 
-def keep_query_convert(keep, keepquery, opts):
+def keep_query_convert(keep, labels: Optional[list[str]] = None):
     count = 0
-
-    if keepquery == "--all":
-        gnotes = keep.getnotes()
-    else:
-        if keepquery[0] == "#":
-            gnotes = keep.findnotes(keepquery, True, opts.archive_only)
-        else:
-            gnotes = keep.findnotes(keepquery, False, opts.archive_only)
-
     notes = []
+    gnotes = keep.get_notes(labels)
 
     for gnote in gnotes:
         notes.append(
@@ -488,95 +513,14 @@ def ui_login(keyring_reset, master_token):
         raise
 
 
-def ui_query(keep, search_term, opts):
-    if search_term is not None:
-        count = keep_query_convert(keep, search_term, opts)
-        print("\nTotal converted notes: " + str(count))
-        return
-    else:
-        kquery = "kquery"
-        while kquery:
-            kquery = click.prompt(
-                "\r\nEnter a keyword search, label search or "
-                + "'--all' to convert Keep notes to md or '--x' to exit",
-                type=str,
-            )
-            if kquery != "--x":
-                count = keep_query_convert(keep, kquery, opts)
-                print("\nTotal converted notes: " + str(count))
-            else:
-                return
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-l", "--labels", type=str, nargs="+")
+    args = parser.parse_args()
 
-
-def ui_welcome_config():
-    mp = settings["media_path"]
-
-    if (":" in mp) or (mp[0] == "/"):
-        raise ValueError(
-            f"Media path: '{mp}' - must be relative to the output path "
-            "and cannot start with / or a drive-mount"
-        )
-
-
-@click.command()
-@click.option(
-    "-r",
-    is_flag=True,
-    help="Will reset and not use the local keep access token in your system's keyring",
-)
-@click.option(
-    "-o", is_flag=True, help="Overwrite any existing markdown files with the same name"
-)
-@click.option("-a", is_flag=True, help="Search and export only archived notes")
-@click.option(
-    "-p", is_flag=True, help="Preserve keep labels with spaces and special characters"
-)
-@click.option(
-    "-s", is_flag=True, help="Skip over any existing notes with the same title"
-)
-@click.option(
-    "-c",
-    is_flag=True,
-    help="Use starting content within note body instead of create date for md filename",
-)
-@click.option("-l", is_flag=True, help="Prepend paragraphs with Logseq style bullets")
-@click.option(
-    "-j", is_flag=True, help="Prepend notes with Joplin front matter tags and dates"
-)
-@click.option(
-    "-i", is_flag=True, help="Import notes from markdown files EXPERIMENTAL!!"
-)
-@click.option(
-    "-b", "--search-term", help="Run in batch mode with a specific Keep search term"
-)
-@click.option("-t", "--master-token", help="Log in using master keep token")
-def main(r, o, a, p, s, c, l, j, i, search_term, master_token):
-    # j = True
-    opts = Options(o, a, p, s, c, l, j, i)
-    click.echo("\r\nWelcome to Keep it Markdown or KIM!\r\n")
-
-    if i and (r or o or a or s or p or c):
-        print(
-            "Importing markdown notes with export options is not compatible -- "
-            "please use -i only to import"
-        )
-        exit()
-
-    if o and s:
-        print(
-            "Overwrite and Skip flags are not compatible together -- "
-            "please use one or the other..."
-        )
-        exit()
-
-    ui_welcome_config()
-
-    keep = ui_login(r, master_token)
-
-    if i:
-        keep_import_notes(keep)
-    else:
-        ui_query(keep, search_term, opts)
+    keep = ui_login(False, settings["master_token"])
+    count = keep_query_convert(keep, labels=args.labels)
+    print("\nTotal converted notes: " + str(count))
 
 
 # Version 0.5.2
