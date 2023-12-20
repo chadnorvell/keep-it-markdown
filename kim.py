@@ -1,13 +1,14 @@
 import argparse
-import datetime
 import getpass
 import imghdr
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from xmlrpc.client import boolean
+from zoneinfo import ZoneInfo
 
 import click
 import gkeepapi
@@ -20,6 +21,11 @@ load_dotenv()
 KEEP_KEYRING_ID = "google-keep-token"
 KEEP_NOTE_URL = "https://keep.google.com/#NOTE/"
 
+try:
+    SYS_TZ = str(Path("/etc/localtime").readlink().relative_to("/usr/share/zoneinfo"))
+except FileNotFoundError:
+    SYS_TZ = "UTC"
+
 settings = {
     "google_userid": os.environ.get("KIM_GOOGLE_USER_ID", ""),
     "master_token": os.environ.get("KIM_KEEP_MASTER_TOKEN", ""),
@@ -28,7 +34,22 @@ settings = {
     "fragments_path": os.environ.get("KIM_FRAGMENTS_PATH", "fragments"),
     "import_path": os.environ.get("KIM_IMPORT_PATH", "import"),
     "import_labels": os.environ.get("KIM_IMPORT_LABELS", "my_label"),
+    "timezone": os.environ.get("KIM_TIMEZONE", SYS_TZ),
 }
+
+UTC = ZoneInfo("UTC")
+TZ = ZoneInfo(settings["timezone"])
+
+
+def localize_datetime(
+    dt: datetime, tz: ZoneInfo, tz2: Optional[ZoneInfo] = None
+) -> datetime:
+    localized = datetime.combine(dt.date(), dt.time(), tz)
+
+    if tz2 is not None:
+        return localized.astimezone(tz2)
+
+    return localized
 
 
 def download_file(file_url: str, file_name: str, file_path: Path) -> Optional[Path]:
@@ -60,34 +81,22 @@ def set_file_extension_from_content(data_file: Path) -> Path:
 
 
 @dataclass
-class Options:
-    overwrite: boolean
-    archive_only: boolean
-    preserve_labels: boolean
-    skip_existing: boolean
-    text_for_title: boolean
-    logseq_style: boolean
-    joplin_frontmatter: boolean
-    import_files: boolean
-
-
-@dataclass
 class Note:
     id: str
     base_title: str
     text: str
+    pinned: boolean
     archived: boolean
     trashed: boolean
-    timestamps: dict
+    created_when: datetime
+    updated_when: datetime
     # Labels starting with an uppercase letter are treated as folders, and
     # those starting with a lowercase letter are treated as tags. Don't assign
     # to more than one folder; only one arbitrary option will be used.
     labels: list[str]
     blobs: list
-    blob_names: list[str]
-    media: list[Path]
-    # Essentially datetime.now() when this is run.
-    instantiated_when: datetime.datetime = field(default_factory=datetime.datetime.now)
+    blob_names: list[str] = field(default_factory=list)
+    media: list[Path] = field(default_factory=list)
 
     @property
     def is_empty(self) -> boolean:
@@ -96,26 +105,6 @@ class Note:
     @property
     def is_fragment(self) -> boolean:
         return not any(label[0].isupper() for label in self.labels)
-
-    @property
-    def created_when(self) -> datetime.datetime:
-        if self.timestamps is not None:
-            return datetime.datetime.strptime(
-                self.timestamps["created"],
-                "%Y-%m-%d %H:%M:%S.%f",
-            )
-
-        return self.instantiated_when
-
-    @property
-    def updated_when(self) -> datetime.datetime:
-        if self.timestamps is not None:
-            return datetime.datetime.strptime(
-                self.timestamps["updated"],
-                "%Y-%m-%d %H:%M:%S.%f",
-            )
-
-        return self.instantiated_when
 
     @property
     def media_links(self) -> Iterable[str]:
@@ -154,7 +143,7 @@ class Note:
         # If it's a fragment, prepend the timestamp. A timestamp-only title is fine.
         if self.is_fragment:
             title_text = title
-            title = self.created_when.strftime("%y%m%d%H%M%S")
+            title = self.local_created_when.strftime("%y%m%d%H%M%S")
 
             if len(title_text) > 0:
                 title += f" {title_text}"
@@ -178,6 +167,14 @@ class Note:
         return [label for label in self.labels if label[0].islower()]
 
     @property
+    def local_created_when(self) -> datetime:
+        return localize_datetime(self.created_when, UTC, TZ)
+
+    @property
+    def local_updated_when(self) -> datetime:
+        return localize_datetime(self.updated_when, UTC, TZ)
+
+    @property
     def folder(self) -> str:
         if self.is_fragment:
             return settings["fragments_path"]
@@ -199,8 +196,8 @@ class Note:
     def front_matter(self) -> str:
         lines = [
             "---",
-            f'created: {self.created_when.strftime("%Y-%m-%dT%H:%M")}',
-            f'updated: {self.updated_when.strftime("%Y-%m-%dT%H:%M")}',
+            f'created: {self.local_created_when.strftime("%Y-%m-%dT%H:%M")}',
+            f'updated: {self.local_updated_when.strftime("%Y-%m-%dT%H:%M")}',
             f"source: {KEEP_NOTE_URL}{str(self.id)}",
         ]
 
@@ -417,10 +414,10 @@ def keep_import_notes(keep):
     for file in os.listdir(dir_path):
         if os.path.isfile(dir_path + file) and file.endswith(".md"):
             with open(dir_path + file, "r", encoding="utf8") as md_file:
-                mod_time = datetime.datetime.fromtimestamp(
+                mod_time = datetime.fromtimestamp(
                     os.path.getmtime(dir_path + file)
                 ).strftime("%Y-%m-%d %H:%M:%S")
-                crt_time = datetime.datetime.fromtimestamp(
+                crt_time = datetime.fromtimestamp(
                     os.path.getctime(dir_path + file)
                 ).strftime("%Y-%m-%d %H:%M:%S")
                 data = md_file.read()
@@ -440,19 +437,16 @@ def keep_query_convert(keep, labels: Optional[list[str]] = None):
     for gnote in gnotes:
         notes.append(
             Note(
-                gnote.id,
-                gnote.title,
-                gnote.text,
-                gnote.archived,
-                gnote.trashed,
-                {
-                    "created": str(gnote.timestamps.created),
-                    "updated": str(gnote.timestamps.updated),
-                },
-                [str(label) for label in gnote.labels.all()],
-                list(gnote.blobs),
-                [],
-                [],
+                id=gnote.id,
+                base_title=gnote.title,
+                text=gnote.text,
+                pinned=gnote.pinned,
+                archived=gnote.archived,
+                trashed=gnote.trashed,
+                labels=[str(label) for label in gnote.labels.all()],
+                blobs=list(gnote.blobs),
+                created_when=gnote.timestamps.created,
+                updated_when=gnote.timestamps.updated,
             )
         )
 
